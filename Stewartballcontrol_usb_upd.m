@@ -1,0 +1,1305 @@
+function StewartBallControl_USB_upd
+% USB camera -> Python tracker -> tilt PD + velocity-only XY D -> IK -> RUMBA.
+% R is the calibrated CYAN center-to-red-marker distance, not MAGENTA radius.
+% Requires tracker REF_R and an actual V-calibrated GREEN/BLUE reference.
+% Requires:
+%   tracker_usb_bridge.py (dual-circle version with REF_R message)
+%   StewartSmoothModel.m
+%   RUMBA firmware supporting HOME, START, SETF, STATUS, HOLD.
+%
+% FRAME-SPREAD MOTION (RAMP) - changes marked "% RAMP:"
+%   Each new camera frame sets a new goal. Instead of jumping to it in one
+%   command and then holding still until the next frame (sprint-and-stop,
+%   heard as a buzz at the camera frame rate), the command moves evenly
+%   from where it is toward the goal over the measured frame period. The
+%   motors therefore move continuously and only change speed at each frame.
+%
+% Normal ball tracking loss:
+%   Freeze target briefly, then HOLD if loss persists.
+%   Automatically resume after stable ball reacquisition.
+%
+% Calibration changes and firmware faults require manual action.
+% RUMBA STATUS counts generated steps, NOT actual shaft position.
+%
+% TEST OFFLINE FIRST. Verify hardware limits and a hardwired E-stop.
+
+%% SETTINGS
+RUN_HARDWARE = true; % SIMULATE FIRST; enable only after bench validation
+COM_PORT = 'COM5';
+BAUD = 250000;
+
+BRIDGE_HOST = '127.0.0.1';
+BRIDGE_PORT = 5051;
+
+% Ball balancing: only Kp, Kd and maximum tilt
+Kp = 2.0;
+Kd = 0.12;
+MAX_TILT_DEG = 2;
+AZIMUTH_OFFSET_DEG = 0;
+
+% Motor timing
+TIMER1_HZ = 2000000;
+MOTOR_STEP_DELAY_TICKS = 2222; % Sets MATLAB's step-rate limit (~900 usteps/s)
+COMMAND_HZ = 100;              % RAMP: was 200; 100 Hz is easier to hold steadily
+STREAM_HEARTBEAT_HZ = 50;
+STATUS_HZ = 10;
+DISPLAY_HZ = 8;
+MAX_COMMAND_LEAD_STEPS = 200;
+
+% RAMP: frame-spread motion settings
+% The ramp lasts slightly longer than one frame period so the motors are
+% still moving when the next frame arrives (no stop between frames).
+RAMP_STRETCH = 1.15;           % ramp duration = 1.15 x measured frame period
+FRAME_PERIOD_INIT_S = 1/30;    % initial guess; measured live from the tracker
+FRAME_PERIOD_MIN_S = 1/120;    % clamp for bunched frames
+FRAME_PERIOD_MAX_S = 0.10;     % clamp for late/missing frames
+
+% SEPARATE XY CONTROLLER: D ONLY (no XY P or I).
+% R = cyan center-to-RED-marker radius, not magenta tracking radius.
+% Ball velocity is measured in R/s. XY target is in R, then converted
+% to motor-model centimeters before inverse kinematics.
+% One controller tuning parameter: XY_KD (seconds).
+ENABLE_XY_FOLLOW = true;
+XY_KD = 0.12;                     % seconds: 1 R/s -> 0.12 R displacement
+MAX_XY_DISPLACEMENT_R = 0.6;   % strict measured distance limit from GREEN base
+% Fixed safeguards (not extra controller gains):
+XY_SPEED_LIMIT_R_S = 0.15;      % maximum XY command slew in R/s
+XY_VELOCITY_FILTER_ALPHA = 0.25; % filter derivative noise; 0..1
+XY_VELOCITY_REJECT_R_S = 5.0;   % reject implausible one-frame spikes
+PLATE_MARKER_TIMEOUT_S = 1.25;  % no blind translation if both blue dots vanish
+% Target is held 5% inside the measured 0.50 R safety boundary.
+XY_TARGET_MARGIN = 0.95;
+% Verify camera/model X/Y mapping and motor directions with plate supported.
+
+% Tracking recovery
+BALL_LOSS_TIMEOUT_S = 0.55;
+AUTO_RESUME_BALL_FRAMES = 3;
+AUTO_RESUME_MIN_S = 0.08;
+AUTO_RESUME_MAX_LAG_STEPS = 30;
+BRIDGE_GAP_TIMEOUT_S = 0.75;
+STATUS_TIMEOUT_S = 1.0;
+NEUTRAL_TIMEOUT_S = 15;
+
+% Stewart platform geometry/motor limits
+SWITCH_DOWN = 21*ones(1,6);
+HOME_DIR_HIGH = [true false true false true false];
+AWAY_SIGN = 1-2*double(HOME_DIR_HIGH);
+MICROSTEPS_PER_REV = 3200;
+POSITION_SCALE = 256;
+MAX_AWAY_STEPS = 1000;
+
+Z_MIN_CM = 16.13;
+Z_MAX_CM = 24.13;
+Z_STEP_CM = 0.05;
+Z_CLEARANCE_CM = 0.15;
+TILT_CHECK_STEP_DEG = 2;
+AZ_CHECK_STEP_DEG = 30;
+
+% Set true ONLY after physical verification.
+SWITCHES_AT_21_VERIFIED = true;
+MOTOR_DIRECTIONS_VERIFIED = true;
+RODS_DETACHED_PLATE_SUPPORTED = true;
+HARDWIRED_ESTOP_AVAILABLE = true;
+CURRENT_AND_ENDSTOPS_VERIFIED = true;
+
+if RUN_HARDWARE
+    assert(all([ ...
+        SWITCHES_AT_21_VERIFIED, ...
+        MOTOR_DIRECTIONS_VERIFIED, ...
+        RODS_DETACHED_PLATE_SUPPORTED, ...
+        HARDWIRED_ESTOP_AVAILABLE, ...
+        CURRENT_AND_ENDSTOPS_VERIFIED]), ...
+        'Verify all hardware prerequisites before running.');
+end
+
+%% INITIALIZE
+geo = StewartSmoothModel('geometry');
+geo.switchAngleDownDeg = SWITCH_DOWN;
+
+port = [];
+bridge = [];
+fig = [];
+seq = 0;
+
+rxBuffer = '';
+bridgeRx = '';
+streaming = false;
+
+lastStatus = nan(1,6);
+cmdU = [0 0];
+cmdQ = zeros(1,6);
+cmdXY = [0 0];  % Additional translation in model X/Y (cm).
+goalXY = [0 0]; % D-only ball-follow translation target (model cm).
+referenceRadiusCm = NaN; % CYAN reference R from Python REF_R message
+ballVelocityRps = [0 0]; % filtered ball velocity, camera R/s
+plateError = [NaN NaN];
+platformAvailable = false;
+lastPlateReceived = NaN;
+platformSeen = false;
+
+% RAMP: state of the current frame-spread move
+rampFromU = [0 0];     % tilt command when the current ramp started
+rampFromXY = [0 0];    % XY command when the current ramp started
+rampT0 = -inf;         % ramp start time (-inf = no ramp, sit at goal)
+framePeriod = FRAME_PERIOD_INIT_S; % smoothed measured camera frame period
+
+zeroAzimuthDeg = NaN;
+calibrated = false;
+plateRadiusCm = 10;
+lastCalValues = nan(1,5);
+
+lastBall = [NaN NaN];
+lastBallReceived = NaN;
+prevError = [0 0];
+lastObservation = NaN;
+
+seenTarget = false;
+trackingAvailable = false;
+rearmRequired = false;
+trackingHold = false;
+
+recoveryFrames = 0;
+recoveryStart = NaN;
+
+try
+    %% IK COVERAGE
+    fprintf('Validating IK coverage...\n');
+
+    fixedZ = findCommonZ();
+    cmdQ = poseToQ(checkedPose(0,0,fixedZ));
+
+    fprintf('Fixed Z = %.2f cm\n',fixedZ);
+
+    %% RUMBA CONNECTION
+    if RUN_HARDWARE
+        fprintf('Connecting RUMBA on %s at %d baud.\n', ...
+            COM_PORT,BAUD);
+
+        port = serialport(COM_PORT,BAUD,'Timeout',0.05);
+        configureTerminator(port,'LF');
+
+        pause(2.2);
+        flush(port);
+
+        fprintf('Homing all six motors...\n');
+        writeline(port,'HOME');
+        awaitToken('HOMED_ALL',120);
+
+        fprintf('Moving to neutral position...\n');
+        startStream();
+        commandNeutral(cmdQ);
+        holdStream();
+
+        fprintf('Neutral position reached.\n');
+    else
+        fprintf('OFFLINE MODE: no motors connected.\n');
+    end
+
+    %% PYTHON TRACKER
+    fprintf('Connecting USB tracker...\n');
+
+    bridge = tcpclient( ...
+        BRIDGE_HOST,BRIDGE_PORT, ...
+        'Timeout',0.10, ...
+        'ConnectTimeout',5);
+
+    fprintf('USB tracker connected.\n');
+
+    %% VISUALIZATION
+    fig = figure( ...
+        'Name','Stewart USB Ball Balancer', ...
+        'NumberTitle','off', ...
+        'Color','w', ...
+        'WindowKeyPressFcn',@onKey);
+
+    ax = axes('Parent',fig);
+    hold(ax,'on');
+    axis(ax,'equal');
+    grid(ax,'on');
+
+    xlabel(ax,'Camera X / reference radius R');
+    ylabel(ax,'Camera Y / reference radius R');
+
+    xlim(ax,[-1.6 1.6]);
+    ylim(ax,[-1.6 1.6]);
+
+    ballHandle = plot(ax,nan,nan,'ro', ...
+        'MarkerSize',12,'LineWidth',2);
+
+    plot(ax,0,0,'g+', ...
+        'MarkerSize',15,'LineWidth',2);
+    platformHandle = plot(ax,nan,nan,'bs', ...
+        'MarkerSize',10,'LineWidth',2);
+
+    plateHandle = plot(ax,nan,nan,'k--', ...
+        'LineWidth',1.5);
+
+    title(ax,'Waiting for calibrated ball tracking');
+
+    %% MAIN CONTROL LOOP
+    clk = tic;
+
+    lastCommandTime = 0;
+    lastPollTime = 0;
+    lastDisplayTime = 0;
+    lastStatusTime = 0;
+    lastPrint = 0;
+    lastSetfTime = -inf;
+    lastReceiveTime = 0;
+
+    goalU = [0 0];
+
+    while isgraphics(fig)
+
+        now = toc(clk);
+
+        %% RECEIVE PYTHON TRACKING DATA
+        messages = receiveBridgeLines();
+
+        if ~isempty(messages)
+            lastReceiveTime = now;
+        end
+
+        newBall = false;
+
+        for j = 1:numel(messages)
+
+            parts = strsplit(messages{j});
+
+            if isempty(parts)
+                continue;
+            end
+
+            switch parts{1}
+
+                case 'CAL'
+                    if numel(parts) == 6
+
+                        values = str2double(parts(2:6));
+
+                        if all(isfinite(values)) && ...
+                                values(1)>0 && values(5)>0
+
+                            changed = ~calibrated || ...
+                                any(abs(values-lastCalValues)>1e-6);
+
+                            if changed
+
+                                if calibrated && seenTarget
+                                    pauseForTracking( ...
+                                        'Calibration changed',false);
+                                end
+
+                                calibrated = true;
+                                lastCalValues = values;
+
+                                zeroAzimuthDeg = values(2);
+                                plateRadiusCm = values(1)*values(5);
+
+                                r = plateRadiusCm;
+                                a = linspace(0,2*pi,161);
+
+                                % REF_R packet immediately follows CAL and
+                                % draws the reference-normalized circle.
+                                set(plateHandle,'XData',NaN,'YData',NaN);
+
+                                lastObservation = NaN;
+                                trackingAvailable = false;
+                                recoveryFrames = 0;
+                                recoveryStart = NaN;
+                                lastBallReceived = NaN;
+                                newBall = false;
+                                goalU = cmdU;
+                                goalXY = cmdXY;
+                                resetRamp(); % RAMP: goal = current command
+                                referenceRadiusCm = NaN;
+                                ballVelocityRps = [0 0];
+                                platformAvailable = false;
+                                lastPlateReceived = NaN;
+
+                                fprintf( ...
+                                    'Calibration loaded. Radius %.2f cm.\n', ...
+                                    plateRadiusCm);
+                            end
+                        end
+                    end
+
+                case 'REF_R'
+                    if numel(parts)>=2 && calibrated
+                        rCm = str2double(parts{2});
+                        if isfinite(rCm) && rCm>0
+                            % Explicit reference-radius handshake; independent
+                            % of the 1.50x MAGENTA detection radius.
+                            referenceRadiusCm = rCm;
+                            fprintf('Reference R (cyan): %.3f cm | XY limit: %.3f cm (0.50 R).\n', ...
+                                rCm,MAX_XY_DISPLACEMENT_R*rCm);
+                            % Sample combined tilt + XY workspace before running.
+                            checkXYWorkspace();
+                            % Show positions and the tracking circle in units R.
+                            a = linspace(0,2*pi,161);
+                            r = plateRadiusCm/referenceRadiusCm;
+                            set(plateHandle,'XData',r*cos(a),'YData',r*sin(a));
+                            xlim(ax,[-max(1.6,1.15*r),max(1.6,1.15*r)]);
+                            ylim(ax,[-max(1.6,1.15*r),max(1.6,1.15*r)]);
+                        end
+                    end
+
+                case 'BALL'
+                    if numel(parts)>=3 && calibrated
+
+                        v = str2double(parts(2:3));
+
+                        % MATLAB secondary protection:
+                        % Ignore ball coordinates outside plate.
+                        if all(isfinite(v)) && ...
+                                norm(v)<=plateRadiusCm
+
+                            lastBall = v;
+                            lastBallReceived = now;
+                            newBall = true;
+                            trackingAvailable = true;
+                        end
+                    end
+
+                case 'PLATE'
+                    % The Python tracker reports upper plate displacement
+                    % relative to the base marker, in camera X/Y cm.
+                    if numel(parts)>=3 && calibrated && ENABLE_XY_FOLLOW
+                        m = str2double(parts(2:3));
+                        if all(isfinite(m))
+                            plateError = m;
+                            lastPlateReceived = now;
+                            platformSeen = true;
+                            platformAvailable = true;
+                            % GREEN is the fixed original center. BLUE midpoint
+                            % is the current moving-plate center. Never allow
+                            % measured center displacement beyond 0.50 R.
+                            if isfinite(referenceRadiusCm) && ...
+                                    norm(m)>MAX_XY_DISPLACEMENT_R*referenceRadiusCm
+                                pauseForTracking( ...
+                                    'Measured XY displacement exceeds 0.50 R',false);
+                            end
+                        end
+                    end
+
+                case 'PLATE_LOST'
+                    % Both BLUE markers were missing beyond grace period.
+                    % HOLD; do not command XY using a stale plate center.
+                    platformAvailable = false;
+                    lastPlateReceived = NaN;
+                    if ENABLE_XY_FOLLOW && platformSeen && seenTarget
+                        pauseForTracking('Plate/base markers missing too long',true);
+                    end
+
+                case 'PLATE_CAL_CHANGED'
+                    % Explicit V reference reset is different from occlusion.
+                    % Require manual R; never silently accept a new zero.
+                    platformAvailable = false;
+                    lastPlateReceived = NaN;
+                    if ENABLE_XY_FOLLOW && seenTarget
+                        pauseForTracking('Plate alignment recalibrated',false);
+                    end
+
+                case 'LOST' 
+                    % No false ball position during missing frames.
+                    trackingAvailable = false;
+                    newBall = false;
+
+                    recoveryFrames = 0;
+                    recoveryStart = NaN;
+                    lastObservation = NaN;
+            end
+        end
+
+        %% INDEPENDENT PLATFORM REFERENCE SAFETY CHECK
+        if ENABLE_XY_FOLLOW && platformSeen && seenTarget && ...
+                ~rearmRequired && ...
+                (~isfinite(lastPlateReceived) || ...
+                 now-lastPlateReceived>PLATE_MARKER_TIMEOUT_S)
+            platformAvailable = false;
+            pauseForTracking('Stale plate position measurement',true);
+        end
+
+        %% AUTOMATIC RECOVERY AFTER BALL LOSS
+        if newBall && trackingHold && ~rearmRequired && ...
+                (~ENABLE_XY_FOLLOW || (platformAvailable && isfinite(referenceRadiusCm)))
+
+            if recoveryFrames == 0
+                recoveryStart = now;
+            end
+
+            recoveryFrames = recoveryFrames+1;
+
+            if recoveryFrames>=AUTO_RESUME_BALL_FRAMES && ...
+                    now-recoveryStart>=AUTO_RESUME_MIN_S
+
+                resumeFromBallLoss();
+            end
+        end
+
+        %% PD CONTROLLER
+        if newBall && trackingAvailable && isfinite(referenceRadiusCm) && ...
+                (~ENABLE_XY_FOLLOW || (platformAvailable && isfinite(referenceRadiusCm))) && ...
+                ~rearmRequired && ~trackingHold
+
+            if isfinite(lastObservation)
+
+                % RAMP: floor raised from 1 ms so bunched frames cannot
+                % create huge derivative spikes.
+                dObs = max(now-lastObservation,FRAME_PERIOD_MIN_S);
+
+                % RAMP: smoothed estimate of the camera frame period.
+                framePeriod = 0.9*framePeriod + ...
+                    0.1*min(dObs,FRAME_PERIOD_MAX_S);
+
+                ballVelocity = ...
+                    (lastBall-prevError)/dObs;
+            else
+                ballVelocity = [0 0];
+            end
+
+            % Separate D-only XY controller. Camera measures BALL relative
+            % to the blue-marker midpoint. Its derivative has units R/s.
+            if isfinite(lastObservation) && dObs<=0.30
+                rawVelocityRps = ballVelocity/referenceRadiusCm;
+                if norm(rawVelocityRps)<=XY_VELOCITY_REJECT_R_S
+                    ballVelocityRps = ...
+                        (1-XY_VELOCITY_FILTER_ALPHA)*ballVelocityRps + ...
+                        XY_VELOCITY_FILTER_ALPHA*rawVelocityRps;
+                else
+                    ballVelocityRps = [0 0]; % suppress tracking jump
+                end
+            else
+                ballVelocityRps = [0 0];
+            end
+            % Desired displacement is in R, then converted to cm for IK.
+            wantedCamR = XY_KD * ballVelocityRps;
+            wantedCamR = limitNorm(wantedCamR, ...
+                XY_TARGET_MARGIN*MAX_XY_DISPLACEMENT_R);
+            if ENABLE_XY_FOLLOW
+                goalXY = cameraXYToModelXY(wantedCamR*referenceRadiusCm);
+            else
+                goalXY = [0 0];
+            end
+
+            prevError = lastBall;
+            lastObservation = now;
+
+            % Original tilt PD remains separate and unchanged.
+            correction = Kp*lastBall + Kd*ballVelocity;
+
+            goalU = limitNorm( ...
+                [-correction(2),correction(1)], ...
+                MAX_TILT_DEG);
+
+            % RAMP: start a new ramp from wherever the command is NOW
+            % (possibly mid-way through the previous ramp) to the new goal.
+            rampFromU = cmdU;
+            rampFromXY = cmdXY;
+            rampT0 = now;
+
+            if RUN_HARDWARE && ~streaming
+
+                startStream();
+
+                lastStatusTime = toc(clk);
+                lastPollTime = lastStatusTime;
+                lastCommandTime = 0;
+                lastSetfTime = -inf;
+            end
+
+            seenTarget = true;
+        end
+
+        %% TEMPORARY BALL LOSS
+        if ~trackingAvailable
+            goalU = cmdU;
+            goalXY = cmdXY;
+            resetRamp(); % RAMP: stop where we are
+            ballVelocityRps = [0 0];
+        end
+
+        if seenTarget && ~rearmRequired && ...
+                now-lastBallReceived>BALL_LOSS_TIMEOUT_S
+
+            pauseForTracking( ...
+                'Ball missing: waiting for reacquisition',true);
+        end
+
+        if seenTarget && ~rearmRequired && ...
+                now-lastReceiveTime>BRIDGE_GAP_TIMEOUT_S
+
+            pauseForTracking( ...
+                'USB tracker gap: waiting for fresh ball',true);
+        end
+
+        %% STREAM HEARTBEAT
+        if RUN_HARDWARE && streaming && seenTarget && ...
+                ~rearmRequired && ~trackingHold && ...
+                (~ENABLE_XY_FOLLOW || (platformAvailable && isfinite(referenceRadiusCm))) && ...
+                trackingAvailable && ...
+                toc(clk)-lastSetfTime>=1/STREAM_HEARTBEAT_HZ
+
+            transmit(cmdQ);
+            lastSetfTime = toc(clk);
+        end
+
+        %% NEW IK TARGET
+        if seenTarget && ~rearmRequired && ...
+                ~trackingHold && trackingAvailable && ...
+                (~ENABLE_XY_FOLLOW || (platformAvailable && isfinite(referenceRadiusCm))) && ...
+                now-lastCommandTime>=1/COMMAND_HZ
+
+            dt = min(max(now-lastCommandTime,0.001),0.10);
+
+            if lastCommandTime == 0
+                dt = 1/COMMAND_HZ;
+            end
+
+            lastCommandTime = now;
+
+            % RAMP: instead of jumping straight to the goal, take the point
+            % that lies (elapsed / ramp duration) of the way from the ramp
+            % start to the goal. The motors therefore travel at a steady
+            % speed for the whole frame instead of sprinting and stopping.
+            rampDuration = RAMP_STRETCH*framePeriod;
+            f = min(1,max(0,(now-rampT0)/rampDuration));
+            uStep  = rampFromU  + f*(goalU  - rampFromU);
+            xyStep = rampFromXY + f*(goalXY - rampFromXY);
+
+            [cmdU,cmdXY,cmdQ] = boundedPoseMove( ...
+                cmdU,cmdXY,cmdQ,uStep,xyStep,dt);
+
+            if RUN_HARDWARE && streaming
+                transmit(cmdQ);
+                lastSetfTime = toc(clk);
+            end
+        end
+
+        %% REQUEST RUMBA STATUS
+        if RUN_HARDWARE && streaming && ...
+                now-lastPollTime>=1/STATUS_HZ
+
+            writeline(port,'STATUS');
+            lastPollTime = now;
+        end
+
+        %% HANDLE RUMBA RESPONSES
+        if RUN_HARDWARE
+
+            lines = receiveLines();
+
+            for j = 1:numel(lines)
+
+                msg = lines{j};
+
+                if strcmp(msg,'WARN STREAM_WATCHDOG_HOLD')
+
+                    if streaming || trackingHold
+                        streaming = false;
+                        pauseForTracking( ...
+                            'RUMBA watchdog stopped the stream',false);
+                    end
+                    continue;
+                end
+
+                if startsWith(msg,'ERR') || ...
+                        contains(msg,'STOPPED')
+
+                    error('RUMBA: %s',msg);
+                end
+
+                if startsWith(msg,'STATUS ')
+
+                    f = strsplit(msg);
+
+                    if numel(f)==8
+
+                        steps = str2double(f(3:8));
+
+                        if all(isfinite(steps))
+
+                            lastStatus = steps;
+                            lastStatusTime = now;
+
+                            lag = max(abs( ...
+                                round(cmdQ/POSITION_SCALE)-steps));
+
+                            if streaming && ...
+                                    lag>MAX_COMMAND_LEAD_STEPS
+
+                                error( ...
+                                    'Target leads step counters by %.0f steps.', ...
+                                    lag);
+                            end
+                        end
+                    end
+                end
+            end
+
+            if streaming && ...
+                    now-lastStatusTime>STATUS_TIMEOUT_S
+
+                error('No valid RUMBA STATUS response.');
+            end
+        end
+
+        %% DISPLAY
+        if now-lastDisplayTime>=1/DISPLAY_HZ
+
+            if trackingAvailable && ~trackingHold && isfinite(referenceRadiusCm)
+                set(ballHandle, ...
+                    'XData',lastBall(1)/referenceRadiusCm, ...
+                    'YData',lastBall(2)/referenceRadiusCm);
+            else
+                set(ballHandle,'XData',NaN,'YData',NaN);
+            end
+
+            if ENABLE_XY_FOLLOW && isfinite(plateError(1)) && isfinite(referenceRadiusCm)
+                set(platformHandle,'XData',plateError(1)/referenceRadiusCm, ...
+                    'YData',plateError(2)/referenceRadiusCm);
+            end
+
+            if rearmRequired
+
+                title(ax, ...
+                    'HOLD: inspect system and press R to rearm');
+
+            elseif trackingHold
+
+                title(ax, ...
+                    'Tracking paused - HOLD; automatic recovery when markers/ball return');
+
+            elseif ENABLE_XY_FOLLOW && platformSeen && ...
+                    isfinite(lastPlateReceived) && ...
+                    now-lastPlateReceived>0.10
+
+                title(ax,'Moving plate markers temporarily hidden - XY D paused');
+
+            elseif calibrated && isfinite(referenceRadiusCm)
+
+                title(ax,sprintf( ...
+                    'Ball [%.2f, %.2f] R | Ball speed %.2f R/s | Tilt %.2f deg | Plate XY %.2f R | Cmd XY %.2f R', ...
+                    lastBall(1)/referenceRadiusCm,lastBall(2)/referenceRadiusCm, ...
+                    norm(ballVelocityRps),norm(cmdU), ...
+                    norm(plateError)/referenceRadiusCm,norm(cmdXY)/referenceRadiusCm));
+            end
+
+            drawnow limitrate;
+            lastDisplayTime = now;
+        end
+
+        if seenTarget && isfinite(referenceRadiusCm) && now-lastPrint>=1
+
+            % RAMP: frame period printed so you can check the ramp timing.
+            fprintf( ...
+                'Ball error %.2f R | Speed %.2f R/s | XY %.2f R | Tilt %.2f deg | Frame %.1f ms | %s\n', ...
+                norm(lastBall)/referenceRadiusCm,norm(ballVelocityRps), ...
+                norm(cmdXY)/referenceRadiusCm,norm(cmdU), ...
+                1000*framePeriod,statusText());
+
+            lastPrint = now;
+        end
+
+        pause(0.002);
+    end
+
+catch ME
+    fprintf(2,'[CONTROL STOPPED] %s\n',ME.message);
+
+    if RUN_HARDWARE && ~isempty(port)
+        try
+            writeline(port,'e');
+        catch
+        end
+        streaming = false;
+    end
+end
+
+%% CLEANUP
+if RUN_HARDWARE && ~isempty(port) && streaming
+    try
+        writeline(port,'HOLD');
+    catch
+    end
+end
+
+if ~isempty(fig) && isgraphics(fig)
+    close(fig);
+end
+
+clear bridge port;
+
+%% ============================================================
+% HELPER FUNCTIONS
+% =============================================================
+
+    function resetRamp()
+        % RAMP: cancel any ramp in progress. Called wherever the goal is
+        % set equal to the current command, so a stale ramp can never pull
+        % the command back toward an old starting point.
+        rampFromU = cmdU;
+        rampFromXY = cmdXY;
+        rampT0 = -inf;
+    end
+
+    function s = statusText()
+        if streaming
+            s = 'STREAMING';
+        else
+            s = 'OFFLINE/HOLD';
+        end
+    end
+
+    function lines = receiveBridgeLines()
+        lines = {};
+
+        if isempty(bridge)
+            return;
+        end
+
+        n = bridge.NumBytesAvailable;
+
+        if n>0
+            bytes = read(bridge,n,'uint8');
+            bridgeRx = [bridgeRx char(bytes(:).')]; %#ok<AGROW>
+        end
+
+        if numel(bridgeRx)>8192
+            error('USB tracker RX backlog.');
+        end
+
+        lf = find(bridgeRx==char(10));
+
+        if isempty(lf)
+            return;
+        end
+
+        start = 1;
+
+        for k = 1:numel(lf)
+            lines{end+1} = strtrim( ...
+                bridgeRx(start:lf(k)-1)); %#ok<AGROW>
+            start = lf(k)+1;
+        end
+
+        bridgeRx = bridgeRx(start:end);
+    end
+
+    function x = limitNorm(x,limit)
+        m = norm(x);
+        if m>limit
+            x = x*(limit/m);
+        end
+    end
+
+    function modelXY = cameraXYToModelXY(cameraXY)
+        % Matches the previous camera-to-model XY mapping. Image X right,
+        % image Y down; physical sign MUST be verified on supported platform.
+        v = [-cameraXY(2); cameraXY(1)];
+        a = deg2rad(zeroAzimuthDeg+AZIMUTH_OFFSET_DEG);
+        T = [cos(a) -sin(a); sin(a) cos(a)];
+        modelXY = (T*v).';
+    end
+
+    function checkXYWorkspace()
+        % Conservative sampled combined tilt/translation check at fixed Z.
+        % Live boundedPoseMove independently checks each intermediate pose.
+        if ~ENABLE_XY_FOLLOW, return; end
+        rho = XY_TARGET_MARGIN*MAX_XY_DISPLACEMENT_R*referenceRadiusCm;
+        for xyAngle = 0:45:315
+            xy = rho*[cosd(xyAngle),sind(xyAngle)];
+            for tilt = [0 MAX_TILT_DEG]
+                for az = 0:60:300
+                    p = StewartSmoothModel('pose',geo,tilt,az,fixedZ,xy);
+                    if ~isTravelValid(p)
+                        error(['XY workspace not reachable at fixed Z, ' ...
+                            '0.50 R bound and selected tilt. ' ...
+                            'Reduce MAX_TILT_DEG or MAX_XY_DISPLACEMENT_R; ' ...
+                            'do not enable motors.']);
+                    end
+                end
+            end
+        end
+    end
+
+    function pauseForTracking(reason,autoResume)
+        if nargin<2
+            autoResume = false;
+        end
+
+        if rearmRequired
+            return;
+        end
+
+        if trackingHold
+            if autoResume
+                return;
+            end
+            trackingHold = false;
+        end
+
+        if RUN_HARDWARE && streaming
+            holdStream();
+        end
+
+        trackingHold = autoResume;
+        rearmRequired = ~autoResume;
+        trackingAvailable = false;
+        goalU = cmdU;
+        goalXY = cmdXY;
+        resetRamp(); % RAMP: stop where we are
+        ballVelocityRps = [0 0];
+        lastObservation = NaN;
+
+        recoveryFrames = 0;
+        recoveryStart = NaN;
+
+        if autoResume
+            fprintf( ...
+                '%s: HOLD; awaiting stable ball detection.\n', ...
+                reason);
+        else
+            fprintf(2, ...
+                '%s: HOLD; inspect system and press R.\n', ...
+                reason);
+        end
+    end
+
+    function resumeFromBallLoss()
+        % Verify RUMBA is homed and step counters are close
+        % to the last calculated target before automatic START.
+        % These counters are not physical encoder feedback.
+
+        if RUN_HARDWARE
+
+            [ok,steps,state] = readHoldStatus(0.6);
+
+            if ~ok || ~strcmp(state,'HOMED')
+
+                trackingHold = false;
+
+                pauseForTracking( ...
+                    'RUMBA not safely HOMED',false);
+                return;
+            end
+
+            gap = max(abs( ...
+                round(cmdQ/POSITION_SCALE)-steps));
+
+            if gap>AUTO_RESUME_MAX_LAG_STEPS
+
+                trackingHold = false;
+
+                pauseForTracking( ...
+                    sprintf( ...
+                    'Held motor target gap %.0f steps',gap), ...
+                    false);
+                return;
+            end
+
+            startStream();
+
+            if toc(clk)-lastBallReceived> ...
+                    BALL_LOSS_TIMEOUT_S
+
+                holdStream();
+                recoveryFrames = 0;
+                recoveryStart = NaN;
+                trackingAvailable = false;
+                return;
+            end
+
+            lastStatus = steps;
+            lastStatusTime = toc(clk);
+            lastPollTime = lastStatusTime;
+            lastSetfTime = -inf;
+        end
+
+        trackingHold = false;
+        recoveryFrames = 0;
+        recoveryStart = NaN;
+
+        % Reset derivative history to avoid velocity spikes.
+        lastObservation = NaN;
+        lastCommandTime = 0;
+        resetRamp(); % RAMP: next frame starts a fresh ramp
+
+        fprintf( ...
+            'Ball reacquired inside plate: balancing resumed.\n');
+    end
+
+    function [ok,steps,state] = readHoldStatus(timeoutS)
+        ok = false;
+        steps = nan(1,6);
+        state = '';
+
+        if isempty(port)
+            return;
+        end
+
+        writeline(port,'STATUS');
+        t = tic;
+
+        while toc(t)<timeoutS
+
+            replyLines = receiveLines();
+
+            for n = 1:numel(replyLines)
+                msg = replyLines{n};
+
+                if startsWith(msg,'ERR') || ...
+                        contains(msg,'STOPPED') || ...
+                        strcmp(msg,'WARN STREAM_WATCHDOG_HOLD')
+                    return;
+                end
+
+                if startsWith(msg,'STATUS ')
+
+                    fields = strsplit(msg);
+
+                    if numel(fields)==8
+
+                        trial = str2double(fields(3:8));
+
+                        if all(isfinite(trial))
+
+                            state = fields{2};
+
+                            if strcmp(state,'HOMED')
+                                steps = trial;
+                                ok = true;
+                                return;
+                            end
+                        end
+                    end
+                end
+            end
+
+            pause(0.002);
+        end
+    end
+
+    function onKey(~,event)
+        if strcmpi(event.Key,'r') && rearmRequired
+
+            rearmRequired = false;
+            trackingHold = false;
+            seenTarget = false;
+            trackingAvailable = false;
+
+            recoveryFrames = 0;
+            recoveryStart = NaN;
+            lastObservation = NaN;
+            ballVelocityRps = [0 0];
+            goalXY = cmdXY;
+            goalU = cmdU;
+            resetRamp(); % RAMP: stop where we are
+            lastBallReceived = NaN;
+            lastCommandTime = 0;
+            lastReceiveTime = toc(clk);
+            platformAvailable = false;
+            lastPlateReceived = NaN;
+
+            fprintf( ...
+                'Manually rearmed. Waiting for ball.\n');
+        end
+    end
+
+    function [uSafe,xySafe,qSafe] = boundedPoseMove( ...
+            uStart,xyStart,qStart,uWanted,xyWanted,dt)
+
+        % Combined tilt+XY 3D IK and step-rate checks.
+        % Each requested translation must be reachable within actuator limits.
+        alpha = 1;
+        maxDeltaSteps = (TIMER1_HZ/MOTOR_STEP_DELAY_TICKS)*dt;
+        maxDeltaXY = XY_SPEED_LIMIT_R_S*referenceRadiusCm*dt;
+
+        for attempt = 1:20
+            uSafe = uStart + alpha*(uWanted-uStart);
+            xySafe = xyStart + alpha*(xyWanted-xyStart);
+            assert(norm(xySafe)<=MAX_XY_DISPLACEMENT_R*referenceRadiusCm+1e-9, ...
+                'Command XY exceeds 0.50 R limit.');
+            try
+                qSafe = poseToQ(poseForU(uSafe,xySafe));
+            catch ME
+                % A full-sized new XY correction might invalidate IK;
+                % try a smaller interpolation instead of faulting instantly.
+                if attempt==20, rethrow(ME); end
+                alpha = alpha*0.5;
+                continue;
+            end
+            deltaSteps = max(abs((qSafe-qStart)/POSITION_SCALE));
+            deltaXY = norm(xySafe-xyStart);
+
+            if deltaSteps<=maxDeltaSteps+1e-6 && deltaXY<=maxDeltaXY+1e-6
+                for fraction = [0.25 0.50 0.75]
+                    poseForU(uStart+fraction*(uSafe-uStart), ...
+                             xyStart+fraction*(xySafe-xyStart));
+                end
+                return;
+            end
+
+            stepRatio = 0.9*maxDeltaSteps/max(deltaSteps,eps);
+            xyRatio = 0.9*maxDeltaXY/max(deltaXY,eps);
+            alpha = alpha*max(0.1,min([0.9,stepRatio,xyRatio]));
+        end
+        error('Motor / XY centering rate limit cannot be satisfied.');
+    end
+
+    function p = poseForU(u,xy)
+        if nargin<2, xy=[0 0]; end
+        tilt = norm(u);
+        if tilt<1e-9
+            az = 0;
+        else
+            az = mod(atan2d(u(2),u(1)) + ...
+                zeroAzimuthDeg+AZIMUTH_OFFSET_DEG,360);
+        end
+        p = checkedPose(tilt,az,fixedZ,xy);
+    end
+
+    function zFound = findCommonZ()
+
+        zFound = NaN;
+
+        tGrid = unique([ ...
+            0:TILT_CHECK_STEP_DEG:MAX_TILT_DEG, ...
+            MAX_TILT_DEG]);
+
+        aGrid = 0:AZ_CHECK_STEP_DEG:359.999;
+
+        for z = Z_MIN_CM:Z_STEP_CM: ...
+                (Z_MAX_CM-Z_CLEARANCE_CM)
+
+            zGuard = z+Z_CLEARANCE_CM;
+            valid = true;
+
+            for zCheck = [z,zGuard]
+
+                for tilt = tGrid
+
+                    for az = aGrid
+
+                        p = StewartSmoothModel( ...
+                            'pose',geo,tilt,az,zCheck);
+
+                        if ~isTravelValid(p)
+                            valid = false;
+                            break;
+                        end
+                    end
+
+                    if ~valid
+                        break;
+                    end
+                end
+
+                if ~valid
+                    break;
+                end
+            end
+
+            if valid
+                zFound = zGuard;
+                return;
+            end
+        end
+
+        error('No valid common Z found.');
+    end
+
+    function okay = isTravelValid(p)
+
+        okay = false;
+
+        if ~p.valid
+            return;
+        end
+
+        away = ...
+            (p.thetaDownDeg-SWITCH_DOWN)* ...
+            MICROSTEPS_PER_REV/360;
+
+        okay = all(isfinite(away)) && ...
+            all(away>=0) && ...
+            all(away<=MAX_AWAY_STEPS);
+    end
+
+    function p = checkedPose(tilt,az,z,xy)
+
+        if nargin<4, xy=[0 0]; end
+        p = StewartSmoothModel( ...
+            'pose',geo,tilt,az,z,xy);
+
+        if ~p.valid
+            error('IK rejected pose: %s',p.reason);
+        end
+
+        if ~isTravelValid(p)
+            error('Pose exceeds motor travel limits.');
+        end
+    end
+
+    function q = poseToQ(p)
+
+        away = ...
+            (p.thetaDownDeg-SWITCH_DOWN)* ...
+            MICROSTEPS_PER_REV/360;
+
+        assert( ...
+            all(isfinite(away)) && ...
+            all(away>=0) && ...
+            all(away<=MAX_AWAY_STEPS), ...
+            'Motor travel exceeded.');
+
+        q = round(away*POSITION_SCALE).*AWAY_SIGN;
+    end
+
+    function startStream()
+
+        writeline(port,'START');
+        awaitToken('STREAM_READY',3);
+        streaming = true;
+    end
+
+    function holdStream()
+
+        if streaming
+            writeline(port,'HOLD');
+            streaming = false;
+        end
+    end
+
+    function transmit(q)
+
+        seq = seq+1;
+
+        writeline(port,sprintf( ...
+            'SETF %d %d %d %d %d %d %d',seq,q));
+    end
+
+    function commandNeutral(q)
+
+        target = round(q/POSITION_SCALE);
+
+        clock = tic;
+        lastSend = -inf;
+        lastPoll = -inf;
+
+        while toc(clock)<NEUTRAL_TIMEOUT_S
+
+            t = toc(clock);
+
+            if t-lastSend>=1/COMMAND_HZ
+                transmit(q);
+                lastSend = t;
+            end
+
+            if t-lastPoll>=1/STATUS_HZ
+                writeline(port,'STATUS');
+                lastPoll = t;
+            end
+
+            replies = receiveLines();
+
+            for k = 1:numel(replies)
+
+                msg = replies{k};
+
+                if startsWith(msg,'ERR') || ...
+                        contains(msg,'STOPPED')
+                    error('RUMBA: %s',msg);
+                end
+
+                if startsWith(msg,'STATUS ')
+
+                    f = strsplit(msg);
+
+                    if numel(f)==8
+
+                        steps = str2double(f(3:8));
+
+                        if all(isfinite(steps))
+
+                            lastStatus = steps;
+
+                            if all(abs(steps-target)<=2)
+                                return;
+                            end
+                        end
+                    end
+                end
+            end
+
+            pause(0.002);
+        end
+
+        error('Neutral pose timeout.');
+    end
+
+    function awaitToken(token,timeout)
+
+        clock = tic;
+
+        while toc(clock)<timeout
+
+            replies = receiveLines();
+
+            for k = 1:numel(replies)
+
+                msg = replies{k};
+
+                if strcmp(msg,token)
+                    return;
+                end
+
+                if startsWith(msg,'ERR')
+                    error('RUMBA: %s',msg);
+                end
+            end
+
+            pause(0.005);
+        end
+
+        error('Timeout waiting for %s.',token);
+    end
+
+    function lines = receiveLines()
+
+        lines = {};
+
+        if isempty(port)
+            return;
+        end
+
+        n = port.NumBytesAvailable;
+
+        if n>0
+            bytes = read(port,n,'uint8');
+            rxBuffer = [rxBuffer char(bytes(:).')]; %#ok<AGROW>
+        end
+
+        if numel(rxBuffer)>4096
+            error('RUMBA serial buffer overflow.');
+        end
+
+        lf = find(rxBuffer==char(10));
+
+        if isempty(lf)
+            return;
+        end
+
+        start = 1;
+
+        for k = 1:numel(lf)
+
+            lines{end+1} = strtrim( ...
+                rxBuffer(start:lf(k)-1)); %#ok<AGROW>
+
+            start = lf(k)+1;
+        end
+
+        rxBuffer = rxBuffer(start:end);
+    end
+end
