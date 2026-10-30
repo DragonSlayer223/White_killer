@@ -2,7 +2,7 @@ function out = StewartSmoothModel(action, varargin)
 % STEWARTSMOOTHMODEL - Matched IK geometry and smooth periodic Z planner.
 %
 % g = StewartSmoothModel('geometry')
-% p = StewartSmoothModel('pose',g,tiltDeg,azimuthDeg,zCm)
+% p = StewartSmoothModel('pose',g,tiltDeg,azimuthDeg,zCm,[xCm yCm])
 % plan = StewartSmoothModel('plan',g,tiltDeg,azimuthStep,zMin,zMax)
 %
 % ANGLE CONVENTION (IMPORTANT):
@@ -51,7 +51,9 @@ switch lower(action)
 
     case 'pose'
         g=varargin{1}; tilt=varargin{2}; az=varargin{3}; z=varargin{4};
-        out=solvePose(g,tilt,az,z);
+        xy = [0 0]; % XY translation in base/model cm; no translation by default.
+        if numel(varargin)>=5, xy=varargin{5}; end
+        out=solvePose(g,tilt,az,z,xy);
 
     case 'plan'
         g=varargin{1}; tilt=varargin{2}; azStep=varargin{3};
@@ -70,7 +72,11 @@ K=[0 -axis(3) axis(2);axis(3) 0 -axis(1);-axis(2) axis(1) 0];
 R=eye(3)+sind(tiltDeg)*K+(1-cosd(tiltDeg))*(K*K);
 end
 
-function p=solvePose(g,tiltDeg,azDeg,zCm)
+function p=solvePose(g,tiltDeg,azDeg,zCm,xyCm)
+if nargin<5, xyCm=[0 0]; end
+assert(isnumeric(xyCm) && numel(xyCm)==2 && all(isfinite(xyCm)), ...
+    'XY translation must be two finite values in cm.');
+xyCm=reshape(xyCm,1,2);
 p.valid=false;
 p.thetaDownDeg=NaN(1,6);
 p.thetaUpDeg=NaN(1,6);
@@ -83,9 +89,10 @@ p.reason='Unreachable pose';
 p.heightCm=zCm;
 p.azimuthDeg=azDeg;
 p.tiltDeg=tiltDeg;
+p.xyCm=xyCm; % Center of moving plate in the base frame.
 if ~all(isfinite([zCm tiltDeg azDeg])),return;end
 R=tiltRotation(tiltDeg,azDeg);
-P=R*g.plateLocal+repmat([0;0;zCm],1,6);
+P=R*g.plateLocal+repmat([xyCm(1);xyCm(2);zCm],1,6);
 p.plate=P; p.R=R;
 for i=1:6
     BP=P(:,i)-g.base(:,i);
